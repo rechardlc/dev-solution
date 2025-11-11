@@ -33,12 +33,182 @@ interface GatewayConfig {
 #### SM2加密 (非对称加密)
 - **用途**：加密关键信息（service路径、SM4密钥和IV）
 - **实现**：前后端各自生成密钥对，交换公钥
-- **特点**：使用对方公钥加密，自己私钥解密
+- **特点**：各自使用对方公钥加密，自己私钥解密
 
 #### SM4加密 (对称加密)
 - **用途**：加密请求体数据
 - **密钥管理**：动态生成16字节密钥和IV
 - **安全性**：每次请求使用新的密钥和IV
+
+#### SM2加密实现细节与前后端一致性规范
+
+##### 关键要点总结
+
+1. **密文格式规范**
+   - `sm-crypto` 的 `doEncrypt()` 返回纯密文数据（C1C3C2格式），不包含 `04` 前缀
+   - 传输层需要添加 `04` 前缀作为格式标识
+   - `04` 是椭圆曲线点格式标识符（未压缩格式）
+
+2. **大小写处理规范**
+   - 十六进制字符串在 JavaScript 中大小写敏感
+   - 加密结果发送给后端：统一转大写
+   - 解密后端返回数据：统一转小写
+
+3. **前后端数据流转**
+   - 前端加密 → 添加 `04` 前缀 + 转大写 → 发送给后端
+   - 后端返回 → 前端接收 → 去掉 `04` 前缀 + 转小写 → 解密
+
+##### 前后端一致性要求
+
+**必须保持一致的项目：**
+
+| 项目 | 前端（sm-crypto） | 后端（Java） | 说明 |
+|------|-----------------|-------------|------|
+| **密文模式** | `cipherMode = 1` (C1C3C2) | 默认 C1C3C2 | 必须一致 |
+| **公钥格式** | 130字符，`04` 开头 | 130字符，`04` 开头 | 必须一致 |
+| **私钥格式** | 64字符十六进制 | 64字符十六进制 | 必须一致 |
+| **数据编码** | UTF-8字符串 | UTF-8字符串 | 必须一致 |
+| **加密结果格式** | 添加 `04` 前缀，大写 | 期望接收带 `04` 前缀 | 必须一致 |
+| **解密输入格式** | 去掉 `04` 前缀，小写 | 返回带 `04` 前缀 | 必须一致 |
+
+**前端加密实现：**
+
+```typescript
+/**
+ * SM2 加密
+ * @param data 待加密数据（UTF-8字符串）
+ * @param publicKey 公钥（130字符，带04前缀）
+ * @returns 加密结果（带04前缀，大写）
+ */
+function encryptSM2(data: string, publicKey: string): string {
+  // 1. 使用 C1C3C2 模式加密
+  const encrypted = sm2.doEncrypt(data, publicKey, 1);
+  
+  // 2. 检查是否已有04前缀，如无则添加
+  // 3. 统一转换为大写（发送给后端）
+  const upperResult = encrypted.toUpperCase();
+  return /^04/i.test(upperResult) ? upperResult : '04' + upperResult;
+}
+```
+
+**前端解密实现：**
+
+```typescript
+/**
+ * SM2 解密
+ * @param encryptedData 加密数据（可能带04前缀，大小写不定）
+ * @param privateKey 私钥（64字符）
+ * @returns 解密后的原始数据（UTF-8字符串）
+ */
+function decryptSM2(encryptedData: string, privateKey: string): string {
+  // 1. 去掉04前缀（如果存在）
+  // 2. 统一转换为小写
+  const processed = /^04/i.test(encryptedData) 
+    ? encryptedData.substring(2).toLowerCase() 
+    : encryptedData.toLowerCase();
+  
+  // 3. 使用 C1C3C2 模式解密
+  return sm2.doDecrypt(processed, privateKey, 1);
+}
+```
+
+**后端实现要求（Java）：**
+
+```java
+/**
+ * SM2 加密（与前端保持一致）
+ * @param data 待加密数据（UTF-8字符串）
+ * @param publicKey 公钥（130字符，带04前缀）
+ * @return 加密结果（带04前缀，大写）
+ */
+public static String encrypt(String data, String publicKey) {
+    // 1. 使用 C1C3C2 模式加密
+    SM2 sm2 = new SM2(null, HexUtil.decodeHex(publicKey));
+    byte[] encrypted = sm2.encrypt(data.getBytes(StandardCharsets.UTF_8));
+    
+    // 2. 添加04前缀并转大写
+    String result = HexUtil.encodeHexStr(encrypted);
+    return "04" + result.toUpperCase();
+}
+
+/**
+ * SM2 解密（与前端保持一致）
+ * @param encryptedData 加密数据（带04前缀）
+ * @param privateKey 私钥（64字符）
+ * @return 解密后的原始数据（UTF-8字符串）
+ */
+public static String decrypt(String encryptedData, String privateKey) {
+    // 1. 去掉04前缀
+    String dataToDecrypt = encryptedData.startsWith("04") 
+        ? encryptedData.substring(2) 
+        : encryptedData;
+    
+    // 2. 使用 C1C3C2 模式解密
+    SM2 sm2 = new SM2(HexUtil.decodeHex(privateKey), null);
+    byte[] decrypted = sm2.decrypt(HexUtil.decodeHex(dataToDecrypt));
+    
+    return new String(decrypted, StandardCharsets.UTF_8);
+}
+```
+
+##### 完整数据流转示例
+
+```typescript
+// ========== 前端加密流程 ==========
+const originalData = "要加密的数据";
+const publicKey = "04xxxxxxxx..."; // 130字符，带04前缀
+
+// 步骤1: sm-crypto 加密（返回小写，无04前缀）
+const encrypted = sm2.doEncrypt(originalData, publicKey, 1);
+// encrypted = "a1b2c3d4e5f6..." (小写，无04前缀)
+
+// 步骤2: 添加04前缀并转大写（发送给后端）
+const toBackend = /^04/i.test(encrypted) 
+  ? encrypted.toUpperCase() 
+  : '04' + encrypted.toUpperCase();
+// toBackend = "04A1B2C3D4E5F6..." (大写，带04前缀)
+
+// ========== 后端处理流程 ==========
+// 后端接收: "04A1B2C3D4E5F6..." (大写，带04前缀)
+// 后端处理业务逻辑...
+// 后端返回: "04A1B2C3D4E5F6..." 或 "04a1b2c3d4e5f6..." (可能大小写不定)
+
+// ========== 前端解密流程 ==========
+const fromBackend = "04A1B2C3D4E5F6..."; // 后端返回的数据
+
+// 步骤1: 去掉04前缀（如果存在）
+// 步骤2: 统一转小写
+const processed = /^04/i.test(fromBackend) 
+  ? fromBackend.substring(2).toLowerCase() 
+  : fromBackend.toLowerCase();
+// processed = "a1b2c3d4e5f6..." (小写，无04前缀)
+
+// 步骤3: sm-crypto 解密
+const decrypted = sm2.doDecrypt(processed, privateKey, 1);
+// decrypted = "要加密的数据" (原始数据)
+```
+
+##### 注意事项
+
+1. **密钥格式验证**
+   - 公钥必须为130字符，且以 `04` 开头
+   - 私钥必须为64字符十六进制
+   - 前后端都需要进行格式验证
+
+2. **大小写统一**
+   - 发送给后端：统一大写
+   - 从后端接收：统一转小写后再解密
+   - 避免大小写不一致导致的解密失败
+
+3. **04前缀处理**
+   - 加密后必须添加 `04` 前缀
+   - 解密前必须去掉 `04` 前缀
+   - 使用正则 `/^04/i` 进行匹配（不区分大小写）
+
+4. **库版本一致性**
+   - 前后端使用相同版本的加密库
+   - 前端：`sm-crypto` 0.3.x
+   - 后端：`Hutool 5.8+` 或 `BouncyCastle 1.70+`
 
 ### 3. 路径管控
 
@@ -226,6 +396,17 @@ type ResponseData = {
 
 ---
 
-**文档版本**: 1.0  
-**最后更新**: 2025年9月22日  
+**文档版本**: 1.1  
+**最后更新**: 2025年1月  
 **维护者**: 前端开发团队
+
+## 更新日志
+
+### v1.1 (2025年1月)
+- 新增 SM2 加密实现细节说明
+- 添加 sm-crypto 大小写敏感问题解答
+- 添加 04 前缀添加/移除原因说明
+- 完善加密/解密流程说明
+
+### v1.0 (2025年9月22日)
+- 初始版本发布
