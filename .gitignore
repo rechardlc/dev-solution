@@ -1,0 +1,12 @@
+# 编辑器本地历史（如 Local History 插件）
+.history/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器临时文件
+*~
+*.swp
+*.swo
